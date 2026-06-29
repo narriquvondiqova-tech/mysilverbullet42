@@ -1,0 +1,810 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// ©LuxAlgo
+// Modified: fixed monetary risk, dynamic position sizing, max 2 trades per day
+// FIXED: DST issue + Performance optimization + Bar 0 Session Error
+// FIXED 2: Partial TP rounding issue causing zombie positions
+// MOD: Added alerts for manual MT5 forward-testing
+// MOD 2: Added RSI filter (overbought/oversold) to improve edge
+// MOD 3: Removed BE & Partial TP, added Friday EOD close, 6k deposit, max 2 trades/day
+
+//@version=6
+strategy("ICT Silver Bullet [LuxAlgo] Strategy FIXED + ALERTS + RSI", shorttitle='LuxAlgo - ICT SB + RSI', max_lines_count=200, max_boxes_count=200, max_labels_count=200, overlay=true, pyramiding=0, default_qty_type=strategy.fixed, initial_capital=6000)
+
+//------------------------------------------------------------------------------
+//Settings
+//-----------------------------------------------------------------------------{
+left        = input.int   (    5     ,         ''     ,  minval=1, maxval=20, group='Swings settings (left)')
+showSB      = input.bool (    true   ,    'Show SB session', inline='SB'    , group='Silver Bullet session' )
+col_SB      = input.color(#b2b5be50,       '     '       , inline='SB'    , group='Silver Bullet session' )
+choice      = input.string('Strict',     ''          , inline='fvg'   , group='FVG'
+  , options =['All FVG', 'Only FVG in the same direction of trend', 'Strict', 'Super-Strict']               )
+superstrict = choice == 'Super-Strict'
+iTrend      = choice != 'All FVG' 
+strict      = choice == 'Strict' 
+stricty     = superstrict or strict
+cBullFVG    = input.color (#4dd0e160,        ''         , inline='fvg'    , group='FVG'                   )
+cBearFVG    = input.color (#ffc1b160,        ''         , inline='fvg'    , group='FVG'                   )
+extend      = input.bool  (   true    ,      'extend'     , inline='fvg'    , group='FVG'                   ) 
+opt         = input.string('previous session (similar)','', inline='TG'     , group='Targets          -         Support/Resistance'
+  , options =['previous session (any)', 'previous session (similar)']                                                              )
+prev = opt == 'previous session (any)'
+cSupLine    = input.color (#b22833  ,        ''         , inline='TG'     , group='Targets          -         Support/Resistance')
+cResLine    = input.color (#3e89fa  ,        ''         , inline='TG'     , group='Targets          -         Support/Resistance')
+keep        = input.bool  (true , 'Keep lines (only in [super-]strict mode)', group='Targets          -         Support/Resistance')
+showT       = input.bool  (false, title = 'MSS ~ session'                   , group='Show'                  )
+showZZ      = input.bool  (false, title =    'Trend'                        , group='Show'                  )
+useLN       = input.bool  (true, 'Trade 03:00-04:00 NY', group='Session Trading Filter')
+useAM       = input.bool  (true, 'Trade 10:00-11:00 NY', group='Session Trading Filter')
+usePM       = input.bool  (false, 'Trade 14:00-15:00 NY', group='Session Trading Filter')
+rrRatio     = input.float (2.0, 'Risk Reward Ratio', minval=0.1, step=0.1, group='Strategy')
+slMode      = input.string('FVG Boundary', 'Stop Loss Mode', options=['FVG Boundary', 'Last Swing'], group='Strategy')
+riskAmount  = input.float (50.0, 'Fixed Risk ($)', minval=0.1, step=0.1, group='Strategy')
+maxTradesPerDay = input.int(2, 'Max Trades per Day', minval=1, step=1, group='Strategy')
+
+// --- ALERT SETTINGS ---
+alertWebhook  = input.string("", "Webhook URL (optional)", group="Alert Settings")
+useAlerts   = input.bool(true, "Enable Alerts for Manual MT5 Trading", group="Alert Settings")
+
+// --- RSI FILTER ---
+useRSIFilter   = input.bool(false, "Enable RSI Filter", group="RSI Filter")
+rsiLength      = input.int(14, "RSI Length", minval=1, group="RSI Filter")
+rsiOverbought  = input.float(70, "Overbought Level", minval=1, maxval=99, step=1, group="RSI Filter")
+rsiOversold    = input.float(30, "Oversold Level", minval=1, maxval=99, step=1, group="RSI Filter")
+
+// --- FRIDAY EOD CLOSE SETTINGS ---
+enableFridayEODClose = input.bool(true, "Force Close on Friday EOD", group="Friday EOD Close")
+fridayCloseHour = input.int(15, "Friday Close Hour (NY)", minval=0, maxval=23, group="Friday EOD Close")
+fridayCloseMinute = input.int(0, "Friday Close Minute", minval=0, maxval=59, group="Friday EOD Close")
+
+int n       = bar_index
+int maxSize = 250
+float minT  = syminfo.mintick
+
+// RSI
+float rsiValue = ta.rsi(close, rsiLength)
+
+//------------------------------------------------------------------------------
+//UDT's
+//-----------------------------------------------------------------------------{
+type piv 
+    int   b 
+    float p
+    bool br
+
+type ZZ 
+    int   [] d
+    int   [] x 
+    float [] y 
+    line  [] l
+
+type FVG 
+    box    box
+    bool   active
+    bool   current
+    bool   traded
+
+type actLine 
+    line ln 
+    bool active
+
+type aPiv
+    piv []GN_swingH    
+    piv []GN_swingL
+    float GN_mnPiv 
+    float GN_mxPiv
+    line[]GN_targHi
+    line[]GN_targLo
+    piv []LN_swingH    
+    piv []LN_swingL
+    float LN_mnPiv 
+    float LN_mxPiv      
+    line[]LN_targHi
+    line[]LN_targLo
+    piv []AM_swingH
+    piv []AM_swingL  
+    float AM_mnPiv 
+    float AM_mxPiv      
+    line[]AM_targHi
+    line[]AM_targLo
+    piv []PM_swingH
+    piv []PM_swingL
+    float PM_mnPiv 
+    float PM_mxPiv
+    line[]PM_targHi
+    line[]PM_targLo
+
+//-----------------------------------------------------------------------------}
+//Variables
+//-----------------------------------------------------------------------------{
+var aPiv a   = aPiv.new(
+   GN_swingH = array.new<piv>()
+ , GN_swingL = array.new<piv>()
+ , GN_mnPiv  = 10e6
+ , GN_mxPiv  = 0
+ , GN_targHi = array.new<line>()  
+ , GN_targLo = array.new<line>() 
+ , LN_swingH = array.new<piv>() 
+ , LN_swingL = array.new<piv>()
+ , LN_mnPiv  = 10e6
+ , LN_mxPiv  = 0 
+ , LN_targHi = array.new<line>()  
+ , LN_targLo = array.new<line>() 
+ , AM_swingH = array.new<piv>() 
+ , AM_swingL = array.new<piv>()
+ , AM_mnPiv  = 10e6
+ , AM_mxPiv  = 0 
+ , AM_targHi = array.new<line>()  
+ , AM_targLo = array.new<line>() 
+ , PM_swingH = array.new<piv>()
+ , PM_swingL = array.new<piv>()
+ , PM_mnPiv  = 10e6
+ , PM_mxPiv  = 0 
+ , PM_targHi = array.new<line>()  
+ , PM_targLo = array.new<line>() 
+ )
+
+var  ZZ           aZZ         = 
+ ZZ.new(
+ array.new < int    >(maxSize,  0), 
+ array.new < int    >(maxSize,  0), 
+ array.new < float  >(maxSize, na),
+ array.new < line   >(maxSize, na)
+ )
+
+var array<FVG> bFVG_bull = array.new<FVG>()
+var array<FVG> bFVG_bear = array.new<FVG>()
+
+var float min  = 10e6
+var float max  =  0.
+
+var hilo  = array.from(0.0, 10e6)
+var aTrend= array.from(0)
+var l_SB  = array.new<   line>() 
+var highs = array.new<actLine>() 
+var lows  = array.new<actLine>()
+var tab   = table.new(position = position.top_right, columns = 1, rows = 1, bgcolor = color(na), border_width = 1)
+var line tradeEntryLine = na
+var line tradeStopLine = na
+var line tradeTargetLine = na
+var float tradeEntryPrice = na
+var float tradeStopPrice = na
+var float tradeTargetPrice = na
+var float tradeInitialRisk = na
+var bool tradeIsLong = false
+
+// ИСПРАВЛЕНИЕ 1: Правильный счётчик торговых дней по NY времени
+var int tradesToday = 0
+var int lastResetDayNY = na
+
+if barstate.isfirst
+    lastResetDayNY := dayofmonth(time)
+
+//-----------------------------------------------------------------------------}
+//General calculations
+//-----------------------------------------------------------------------------{
+float ph = ta.pivothigh(left, 1)
+float pl = ta.pivotlow (left, 1)
+
+// ИСПРАВЛЕНИЕ 1: Сброс счётчика при смене дня в NY времени
+int currentNYDay = dayofmonth(time)
+if currentNYDay != lastResetDayNY
+    tradesToday := 0
+    lastResetDayNY := currentNYDay
+
+// --- FRIDAY EOD CLOSE CHECK ---
+bool isFridayEOD = false
+if enableFridayEODClose
+    int currentDayOfWeek = dayofweek(time)
+    int currentHour = hour(time)
+    int currentMinute = minute(time)
+    isFridayEOD := currentDayOfWeek == dayofweek.friday and currentHour == fridayCloseHour and currentMinute == fridayCloseMinute
+
+//-----------------------------------------------------------------------------}
+//Methods/Functions
+//-----------------------------------------------------------------------------{
+f_isType(string str) => 
+    ( syminfo.type == 'stock'   and str == 'stock'  ) or 
+     (syminfo.type == 'futures' and str == 'futures') or 
+     (syminfo.type == 'index'   and str == 'index'  ) or 
+     (syminfo.type == 'forex'   and str == 'forex'  ) or 
+     (syminfo.type == 'crypto'  and str == 'crypto' ) or 
+     (syminfo.type == 'fund'    and str == 'fund'   ) 
+
+f_timeSess(string timezone, string session) => not na(time(timeframe.period, session, timezone)) 
+
+//Silver Bullet Periods
+bool SB_LN_per = f_timeSess("America/New_York", "0300-0400")
+bool SB_AM_per = f_timeSess("America/New_York", "1000-1100")
+bool SB_PM_per = f_timeSess("America/New_York", "1400-1500")
+
+bool is_in_SB = SB_LN_per or SB_AM_per or SB_PM_per
+bool canTradeSB = (useLN and SB_LN_per) or (useAM and SB_AM_per) or (usePM and SB_PM_per)
+bool strSB    = is_in_SB  and not is_in_SB [1]
+bool strLN    = SB_LN_per and not SB_LN_per[1]
+bool strAM    = SB_AM_per and not SB_AM_per[1]
+bool strPM    = SB_PM_per and not SB_PM_per[1]
+bool endSB    = not is_in_SB  and is_in_SB [1]
+bool endLN    = not SB_LN_per and SB_LN_per[1]
+bool endAM    = not SB_AM_per and SB_AM_per[1]
+bool endPM    = not SB_PM_per and SB_PM_per[1]
+
+minimum_trade_framework = 
+ f_isType('forex') ? syminfo.mintick    * 15 * 10 : 
+ f_isType('index') or 
+ f_isType('futures') ? syminfo.mintick    * 40 :  0
+
+f_lastSwingLow() =>
+    float result = na
+    if a.GN_swingL.size() > 0
+        result := a.GN_swingL.get(0).p
+    result
+
+f_lastSwingHigh() =>
+    float result = na
+    if a.GN_swingH.size() > 0
+        result := a.GN_swingH.get(0).p
+    result
+
+f_updateTradeLines() =>
+    if not na(tradeEntryLine)
+        tradeEntryLine.set_x2(n + 200)
+    if not na(tradeStopLine)
+        tradeStopLine.set_x2(n + 200)
+    if not na(tradeTargetLine)
+        tradeTargetLine.set_x2(n + 200)
+
+method in_out(ZZ aZZ, int d, int x1, float y1, int x2, float y2) =>
+    aZZ.d.unshift(d), aZZ.x.unshift(x2), aZZ.y.unshift(y2), aZZ.d.pop(), aZZ.x.pop(), aZZ.y.pop()
+    if showZZ
+        aZZ.l.unshift(line.new(x1, y1, x2, y2, color= color.new(color.blue, 50))), aZZ.l.pop().delete()
+
+f_setTrend() =>
+    //
+    int MSS_dir = aTrend.get(0)
+    int iH = aZZ.d.get(2) ==  1 ? 2 : 1
+    int iL = aZZ.d.get(2) == -1 ? 2 : 1
+    //
+    switch
+        // MSS Bullish
+        close > aZZ.y.get(iH) and aZZ.d.get(iH) ==  1 and MSS_dir <  1 =>
+            aTrend.set(0,  1)
+        // MSS Bearish
+        close < aZZ.y.get(iL) and aZZ.d.get(iL) == -1 and MSS_dir > -1 =>
+            aTrend.set(0, -1)
+
+// ИСПРАВЛЕНИЕ 2: Оптимизированная очистка массивов
+f_clearActLines(array<actLine> arr) =>
+    for i = 0 to arr.size() - 1
+        arr.get(i).ln.delete()
+    array.clear(arr)
+
+f_clearLines(array<line> arr) =>
+    for i = 0 to arr.size() - 1
+        arr.get(i).delete()
+    array.clear(arr)
+
+f_clearBoxes(array<box> arr) =>
+    for i = 0 to arr.size() - 1
+        arr.get(i).delete()
+    array.clear(arr)
+
+f_swings(bool start, bool end, string str, color col, float min, float max) => 
+    //
+    max_bars_back(time, 1000)
+    var int MSS_dir = aTrend.get(0)
+    //
+    x2       = n -1
+
+    array<piv> swingH = array.new<piv>()
+    array<piv> swingL = array.new<piv>()
+    float mnPiv  = na
+    float mxPiv  = na
+    array<line> targHi = array.new<line>() 
+    array<line> targLo = array.new<line>() 
+    bool  active = false
+
+    switch str 
+        'GN' => 
+            swingH := a.GN_swingH
+            swingL := a.GN_swingL
+            mnPiv  := a.GN_mnPiv            
+            mxPiv  := a.GN_mxPiv
+            targHi := a.GN_targHi
+            targLo := a.GN_targLo
+            active := is_in_SB
+        'LN' => 
+            swingH := a.LN_swingH            
+            swingL := a.LN_swingL
+            mnPiv  := a.LN_mnPiv            
+            mxPiv  := a.LN_mxPiv              
+            targHi := a.LN_targHi
+            targLo := a.LN_targLo
+            active := SB_LN_per
+        'AM' => 
+            swingH := a.AM_swingH            
+            swingL := a.AM_swingL
+            mnPiv  := a.AM_mnPiv            
+            mxPiv  := a.AM_mxPiv                
+            targHi := a.AM_targHi
+            targLo := a.AM_targLo
+            active := SB_AM_per
+        'PM' => 
+            swingH := a.PM_swingH                    
+            swingL := a.PM_swingL
+            mnPiv  := a.PM_mnPiv            
+            mxPiv  := a.PM_mxPiv                 
+            targHi := a.PM_targHi
+            targLo := a.PM_targLo
+            active := SB_PM_per
+
+    if start 
+        hilo.set(0,  0  )
+        hilo.set(1, 10e6) 
+        if stricty ? not keep : true
+            f_clearActLines(highs)
+            f_clearActLines(lows)
+            f_clearLines(targHi)
+            f_clearLines(targLo)
+            f_clearLines(a.GN_targHi)
+            f_clearLines(a.GN_targLo)
+            f_clearLines(a.LN_targHi)
+            f_clearLines(a.LN_targLo)
+            f_clearLines(a.AM_targHi)
+            f_clearLines(a.AM_targLo)
+            f_clearLines(a.PM_targHi)
+            f_clearLines(a.PM_targLo)
+
+    if active 
+        hilo.set(0, math.max(hilo.get(0), high))
+        hilo.set(1, math.min(hilo.get(1), low ))
+
+    if not na(ph) 
+        if ph > mxPiv
+            mxPiv := ph
+        if swingH.size() > 0
+            for i      = swingH.size() -1 to 0
+                get    = swingH.get(i)
+                if ph >= get.p
+                    swingH.remove(i)
+        swingH.unshift(piv.new(n -1, ph))    
+
+        if str == 'GN' or str == 'LN'   
+            dir  = aZZ.d.get (0) 
+            x1   = aZZ.x.get (0) 
+            y1   = aZZ.y.get (0) 
+            y2   =    nz(high[1])
+            //
+            if dir <  1
+                aZZ.in_out( 1, x1, y1, x2, y2)
+            else
+                if dir ==  1 and ph > y1 
+                    aZZ.x.set(0, x2), aZZ.y.set(0, y2)    
+                    if showZZ
+                        aZZ.l.get(0).set_xy2  (x2 ,  y2)  
+    if not na(pl)
+        if pl < mnPiv
+            mnPiv := pl    
+        if swingL.size() > 0
+            for i      = swingL.size() -1 to 0
+                get    = swingL.get(i)
+                if pl <= get.p
+                    swingL.remove(i)
+        swingL.unshift(piv.new(n -1, pl))
+        //
+        if str == 'GN' or str == 'LN'   
+            dir  = aZZ.d.get (0) 
+            x1   = aZZ.x.get (0) 
+            y1   = aZZ.y.get (0) 
+            y2   =    nz(low [1])
+            //
+            if dir > -1
+                aZZ.in_out(-1, x1, y1, x2, y2)
+            else
+                if dir == -1 and pl < y1 
+                    aZZ.x.set(0, x2), aZZ.y.set(0, y2)          
+                    if showZZ
+                        aZZ.l.get(0).set_xy2  (x2 , y2)                         
+    //
+    iH = aZZ.d.get(2) ==  1 ? 2 : 1
+    iL = aZZ.d.get(2) == -1 ? 2 : 1
+    //
+    switch
+        // MSS Bullish
+        close > aZZ.y.get(iH) and aZZ.d.get(iH) ==  1 and MSS_dir <  1 =>
+            MSS_dir :=  1 
+            if active and showT
+                line.new(aZZ.x.get(iH), aZZ.y.get(iH), n, aZZ.y.get(iH), color=cResLine, width=2)
+
+        // MSS Bearish
+        close < aZZ.y.get(iL) and aZZ.d.get(iL) == -1 and MSS_dir > -1 =>
+            MSS_dir := -1 
+            if active and showT
+                line.new(aZZ.x.get(iL), aZZ.y.get(iL), n, aZZ.y.get(iL), color=cSupLine, width=2)
+
+    if end
+        sz  = swingH.size()
+        if sz > 0
+            for i = 0 to sz -1
+                y = swingH.get(i).p
+                if y > (stricty ? min : hilo.get(0))
+                    targHi.unshift(line.new(swingH.get(i).b, y, n, y, color=cResLine))
+                    highs.unshift(actLine.new(line.new(   n, y, n, y, color=cResLine), true))
+
+        sz := swingL.size()
+        if sz > 0
+            for i = 0 to sz -1
+                y = swingL.get(i).p
+                if y < (stricty ? max : hilo.get(1))
+                    targLo.unshift(line.new(swingL.get(i).b, y, n, y, color=cSupLine))
+                    lows.unshift(actLine.new(line.new(    n, y, n, y, color=cSupLine), true))
+
+        swingH.clear()     
+        swingL.clear()     
+
+        mnPiv := 10e6
+        mxPiv := 0
+
+    if showZZ
+        if not na(ph) or not na(pl)
+            aZZ.l.get(0).set_color(MSS_dir == 1 ? cResLine : cSupLine)
+
+    aTrend.set(0, MSS_dir)
+
+//-------------------------------------------}
+//Execution
+//-------------------------------------------}
+f_setTrend()
+
+trend    = aTrend.get(0)
+
+//Targets
+targetHi = false
+targetLo = false
+
+hSz  = highs.size() 
+if hSz > 100
+    highs.pop().ln.delete()
+
+hSz := highs.size() 
+
+if hSz > 0
+    for i = 0 to hSz -1 
+        get = highs.get(i)
+        if get.active
+            get.ln.set_x2(n)
+            if high > get.ln.get_y2() 
+                get.active := false
+                targetHi   := true
+                
+lSz  = lows.size() 
+if lSz > 100
+    lows.pop().ln.delete()
+
+lSz := lows.size() 
+
+if lSz > 0
+    for i = 0 to lSz -1 
+        get = lows.get(i)
+        if get.active
+            get.ln.set_x2(n)
+            if low  < get.ln.get_y2() 
+                get.active := false
+                targetLo   := true
+
+// --- FRIDAY EOD FORCE CLOSE ---
+if isFridayEOD and strategy.position_size != 0
+    if strategy.position_size > 0
+        strategy.close('Long', comment="Friday EOD Close")
+        if useAlerts
+            alert("🔴 FRIDAY EOD CLOSE LONG {{ticker}} @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+    else if strategy.position_size < 0
+        strategy.close('Short', comment="Friday EOD Close")
+        if useAlerts
+            alert("🔴 FRIDAY EOD CLOSE SHORT {{ticker}} @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+// ИСПРАВЛЕНИЕ 3: Проверка на микроскопические остатки позиции
+if strategy.position_size != 0
+    f_updateTradeLines()
+    
+    // Если остаток позиции очень маленький, закрываем его полностью
+    if math.abs(strategy.position_size) < 0.0001 or (strategy.position_size > 0 and strategy.position_size < 1) or (strategy.position_size < 0 and strategy.position_size > -1)
+        if strategy.position_size > 0
+            strategy.close('Long', qty=math.abs(strategy.position_size))
+            if useAlerts
+                alert("ZOMBIE CLOSE LONG {{ticker}} @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+        else if strategy.position_size < 0
+            strategy.close('Short', qty=math.abs(strategy.position_size))
+            if useAlerts
+                alert("ZOMBIE CLOSE SHORT {{ticker}} @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+        tradesToday := tradesToday + 1
+
+if strategy.position_size > 0
+    strategy.exit('Long Exit', 'Long', stop=tradeStopPrice, limit=tradeTargetPrice)
+else if strategy.position_size < 0
+    strategy.exit('Short Exit', 'Short', stop=tradeStopPrice, limit=tradeTargetPrice)
+
+// ИСПРАВЛЕНИЕ 4: Ограничение размера хранилища
+if l_SB.size() > 50
+    l_SB.pop().delete()
+
+if bFVG_bull.size() > 30
+    get_del = bFVG_bull.pop()
+    get_del.box.delete()
+    
+if bFVG_bear.size() > 30
+    get_del = bFVG_bear.pop()
+    get_del.box.delete()
+
+// SB session vLines & 'lock' previous FVG boxes
+if strSB
+
+    min := 10e6
+    max :=  0.
+
+    if showSB
+        l_SB.unshift(line.new(n, close, n, close + minT
+                   , color= col_SB, extend=extend.both))
+
+    if bFVG_bull.size() > 0
+        for i = 0 to math.min(29, bFVG_bull.size() - 1)
+            get  = bFVG_bull.get(i)
+            if n > get.box.get_right() - 1
+                if get.current == true
+                    get.current := false
+                    
+    if bFVG_bear.size() > 0
+        for i = 0 to math.min(29, bFVG_bear.size() - 1)
+            get  = bFVG_bear.get(i)
+            if n > get.box.get_right() - 1
+                if get.current == true
+                    get.current := false
+
+//FVG's
+if is_in_SB
+    trend   := aTrend.get(0)
+    if iTrend
+        switch trend 
+            //bullish
+            1 => 
+                if low  > high[2]
+                    FVG newBullFVG = FVG.new(
+                       box = box.new(n-2, low, n, high[2], border_color=color(na), bgcolor=cBullFVG)
+                     , active = false
+                     , current = true
+                     , traded = false
+                     )
+                    bFVG_bull.unshift(newBullFVG)
+            //bearish
+            => 
+                if high < low [2]
+                    FVG newBearFVG = FVG.new(
+                       box = box.new(n-2, low[2], n, high, border_color=color(na), bgcolor=cBearFVG)
+                     , active = false
+                     , current = true
+                     , traded = false
+                     )
+                    bFVG_bear.unshift(newBearFVG)
+    else 
+        if low  > high[2]
+            FVG newBullFVG = FVG.new(
+               box = box.new(n, low, n, high[2], border_color=color(na), bgcolor=cBullFVG)
+             , active = false
+             , current = true
+             , traded = false
+             )
+            bFVG_bull.unshift(newBullFVG)
+
+        if high < low [2]
+            FVG newBearFVG = FVG.new(
+               box = box.new(n, low[2], n, high, border_color=color(na), bgcolor=cBearFVG)
+             , active = false
+             , current = true
+             , traded = false
+             )
+            bFVG_bear.unshift(newBearFVG)
+
+if endSB
+    if showSB 
+        l_SB.unshift(line.new(n, close, n, close + minT
+                   , color= col_SB, extend=extend.both))
+
+bool longEntrySignal = false
+bool shortEntrySignal = false
+
+// --- ALERT CONDITION VARIABLES (for GUI alerts) ---
+bool alertLongEntry = false
+bool alertShortEntry = false
+
+if bFVG_bull.size() > 0
+    for i = 0 to math.min(29, bFVG_bull.size() - 1)
+        get   =  bFVG_bull.get      (i)
+        bLeft =  get. box.get_left  ( )
+        bTop  =  get. box.get_top   ( )
+        bBot  =  get. box.get_bottom( )            
+        if n  -  bLeft < 1000
+            if get.current 
+                if is_in_SB 
+                    if close <    bBot 
+                        if superstrict 
+                            get.current  := false                           
+                            get.box.set_bgcolor(color.new(color.blue, 100))
+                            get.box.set_right(bLeft)
+                        if superstrict or strict                     
+                            get.active  := false
+                    else
+                        if extend                                          
+                            if get.active 
+                                get.box.set_right(n)
+                    if not get.active 
+                        if low  < bTop and close > bBot
+                            get.active := true  
+                            bool longSignal = canTradeSB and (trend == 1 or aTrend.get(0) == 1) and not get.traded and strategy.position_size == 0 and tradesToday < maxTradesPerDay
+                            // === RSI FILTER FOR LONG ===
+                            if useRSIFilter
+                                longSignal := longSignal and rsiValue < rsiOverbought
+                            if longSignal
+                                float lastSwingLow = f_lastSwingLow()
+                                float stopPrice = slMode == 'Last Swing' and not na(lastSwingLow) ? lastSwingLow : bBot - minimum_trade_framework
+                                float entryPrice = close
+                                float riskPerUnit = entryPrice - stopPrice
+                                if riskPerUnit > 0
+                                    float qty = riskAmount / riskPerUnit
+                                    float targetPrice = entryPrice + riskPerUnit * rrRatio
+                                    tradeEntryPrice := entryPrice
+                                    tradeStopPrice := stopPrice
+                                    tradeTargetPrice := targetPrice
+                                    tradeInitialRisk := riskPerUnit
+                                    tradeIsLong := true
+                                    get.traded := true
+                                    longEntrySignal := true
+                                    alertLongEntry := true
+                                    tradesToday := tradesToday + 1
+                                    strategy.entry('Long', strategy.long, qty=qty)
+                                    strategy.exit('Long Exit', 'Long', stop=stopPrice, limit=targetPrice)
+                                    tradeEntryLine := line.new(n, tradeEntryPrice, n + 200, tradeEntryPrice, color=color.blue, style=line.style_dashed, width=2)
+                                    tradeStopLine := line.new(n, tradeStopPrice, n + 200, tradeStopPrice, color=color.red, width=2)
+                                    tradeTargetLine := line.new(n, tradeTargetPrice, n + 200, tradeTargetPrice, color=color.green, width=2)
+                                    
+                                    // --- LONG ENTRY ALERT ---
+                                    if useAlerts
+                                        string msg = "🚀 LONG ENTRY {{ticker}} | Entry=" + str.tostring(entryPrice, format.mintick) 
+                                          + " | SL=" + str.tostring(stopPrice, format.mintick) 
+                                          + " | TP=" + str.tostring(targetPrice, format.mintick)
+                                        alert(msg, alert.freq_once_per_bar_close)
+                            if extend
+                                get.box.set_right(n)                            
+                if endSB 
+                    if get.active 
+                        if strict
+                            if close < bBot
+                                get.active := false
+                        if superstrict 
+                            if close < bTop
+                                get.active := false
+                    if not get.active 
+                        get.box.set_bgcolor(color.new(color.blue, 100))
+                        get.box.set_right(bLeft)
+
+                    if get.active 
+                        min := math.min(min, bBot + minimum_trade_framework)
+                        if extend
+                            get.box.set_right(n)    
+
+                if endSB[1]
+                    get.active := false
+
+if bFVG_bear.size() > 0
+    for i = 0 to math.min(29, bFVG_bear.size() - 1)
+        get   =  bFVG_bear.get       (i)                     
+        bLeft =  get.box.  get_left  ( )
+        bTop  =  get.box.  get_top   ( )            
+        bBot  =  get.box.  get_bottom( )            
+        if n  -  bLeft   <    1000            
+            if get.current 
+                if is_in_SB 
+                    if close >    bTop 
+                        if superstrict 
+                            get.current  := false   
+                            get.box.set_bgcolor(color.new(color.blue, 100))
+                            get.box.set_right(bLeft)                                     
+                        if superstrict or strict                     
+                            get.active  := false
+                    else
+                        if extend
+                            if get.active 
+                                get.box.set_right(n)
+                    if not get.active
+                        if high > bBot and close < bTop
+                            get.active := true                                 
+                            bool shortSignal = canTradeSB and (trend == -1 or aTrend.get(0) == -1) and not get.traded and strategy.position_size == 0 and tradesToday < maxTradesPerDay
+                            // === RSI FILTER FOR SHORT ===
+                            if useRSIFilter
+                                shortSignal := shortSignal and rsiValue > rsiOversold
+                            if shortSignal
+                                float lastSwingHigh = f_lastSwingHigh()
+                                float stopPrice = slMode == 'Last Swing' and not na(lastSwingHigh) ? lastSwingHigh : bTop + minimum_trade_framework
+                                float entryPrice = close
+                                float riskPerUnit = stopPrice - entryPrice
+                                if riskPerUnit > 0
+                                    float qty = riskAmount / riskPerUnit
+                                    float targetPrice = entryPrice - riskPerUnit * rrRatio
+                                    tradeEntryPrice := entryPrice
+                                    tradeStopPrice := stopPrice
+                                    tradeTargetPrice := targetPrice
+                                    tradeInitialRisk := riskPerUnit
+                                    tradeIsLong := false
+                                    get.traded := true
+                                    shortEntrySignal := true
+                                    alertShortEntry := true
+                                    tradesToday := tradesToday + 1
+                                    strategy.entry('Short', strategy.short, qty=qty)
+                                    strategy.exit('Short Exit', 'Short', stop=stopPrice, limit=targetPrice)
+                                    tradeEntryLine := line.new(n, tradeEntryPrice, n + 200, tradeEntryPrice, color=color.blue, style=line.style_dashed, width=2)
+                                    tradeStopLine := line.new(n, tradeStopPrice, n + 200, tradeStopPrice, color=color.red, width=2)
+                                    tradeTargetLine := line.new(n, tradeTargetPrice, n + 200, tradeTargetPrice, color=color.green, width=2)
+                                    
+                                    // --- SHORT ENTRY ALERT ---
+                                    if useAlerts
+                                        string msg = "🐻 SHORT ENTRY {{ticker}} | Entry=" + str.tostring(entryPrice, format.mintick) 
+                                          + " | SL=" + str.tostring(stopPrice, format.mintick) 
+                                          + " | TP=" + str.tostring(targetPrice, format.mintick)
+                                        alert(msg, alert.freq_once_per_bar_close)
+                            if extend
+                                get.box.set_right(n)
+                if endSB 
+                    if get.active 
+                        if strict
+                            if close > bTop
+                                get.active := false
+                        if superstrict
+                            if close > bBot
+                                get.active := false
+                    if not get.active 
+                        get.box.set_bgcolor(color.new(color.blue, 100))
+                        get.box.set_right(bLeft)
+
+                    if get.active 
+                        max := math.max(max, bTop - minimum_trade_framework)
+                        if extend
+                            get.box.set_right(n)    
+
+                if endSB[1]
+                    get.active := false
+
+if prev
+    f_swings(strSB, endSB, 'GN', col_SB, min, max)
+else
+    f_swings(strLN, endLN, 'LN', col_SB, min, max)
+    f_swings(strAM, endAM, 'AM', col_SB, min, max)
+    f_swings(strPM, endPM, 'PM', col_SB, min, max)
+
+//-------------------------------------------}
+//Plotchar/table
+//-------------------------------------------}
+int tfs = int(math.round((60 / (timeframe.in_seconds(timeframe.period) / 60)) / 2))
+
+plotchar(SB_LN_per and not SB_LN_per[1] and showSB
+ , title= '3-4 AM' , location=location.top, text= '3-4 AM\nNY', color=color(na)
+ , textcolor=col_SB, offset= +tfs)
+
+plotchar(SB_AM_per and not SB_AM_per[1] and showSB
+ , title='10-11 AM', location=location.top, text='10-11 AM\nNY', color=color(na)
+ , textcolor=col_SB, offset= +tfs)
+
+plotchar(SB_PM_per and not SB_PM_per[1] and showSB
+ , title= '2-3 PM' , location=location.top, text= '2-3 PM\nNY', color=color(na)
+ , textcolor=col_SB, offset= +tfs)
+
+plotchar(targetHi ? high : na, 'target high', '•', location.abovebar, color=cResLine, size=size.small)     
+plotchar(targetLo ? low  : na, 'target low' , '•', location.belowbar, color=cSupLine, size=size.small)     
+
+plotshape(longEntrySignal, title='Long Entry', style=shape.arrowup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(shortEntrySignal, title='Short Entry', style=shape.arrowdown, location=location.abovebar, color=color.red, size=size.small)
+
+// --- ALERT CONDITIONS (for GUI-based webhook alerts) ---
+alertcondition(alertLongEntry, title="📗 Long Entry Signal", message='{"action":"buy","ticker":"{{ticker}}","price":"{{close}}","time":"{{time}}"}')
+alertcondition(alertShortEntry, title="📕 Short Entry Signal", message='{"action":"sell","ticker":"{{ticker}}","price":"{{close}}","time":"{{time}}"}')
+
+if barstate.islast
+    if timeframe.in_seconds(timeframe.period) > 15 * 60
+        table.cell(tab, 0, 0, text = 'Please use a timeframe <= 15 minutes', text_color=#FF0000)
