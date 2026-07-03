@@ -168,12 +168,10 @@ method type(string str) =>
      (syminfo.type == 'crypto'  and str == 'crypto' ) or 
      (syminfo.type == 'fund'    and str == 'fund'   ) 
 
-method timeSess(string timezone, string session) => time(timeframe.period, session, timezone) 
-
-//Silver Bullet Periods
-SB_LN_per = "America/New_York".timeSess(londonSession)
-SB_AM_per = "America/New_York".timeSess(amSession)
-SB_PM_per = "America/New_York".timeSess(pmSession)
+//Silver Bullet Periods - Check if current time is within session
+SB_LN_per = timeframe.in_session(londonSession, "America/New_York")
+SB_AM_per = timeframe.in_session(amSession, "America/New_York")
+SB_PM_per = timeframe.in_session(pmSession, "America/New_York")
 
 is_in_SB  = SB_LN_per or SB_AM_per or SB_PM_per
 strSB     = is_in_SB  and not is_in_SB [1]
@@ -222,7 +220,7 @@ f_swings(start, end, str, col, min, max) =>
     float mxPiv  = na
     line[]targHi = na 
     line[]targLo = na 
-    bool  active = na
+    bool active = false
 
     switch str 
         'GN' => 
