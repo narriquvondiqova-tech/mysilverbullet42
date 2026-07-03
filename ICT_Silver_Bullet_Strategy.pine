@@ -7,7 +7,7 @@ strategy("ICT Silver Bullet [LuxAlgo]", shorttitle='LuxAlgo - ICT Silver Bullet'
 //------------------------------------------------------------------------------
 //Settings
 //-----------------------------------------------------------------------------{                            
-left        = input.int   (    5     ,         ''     ,  min=1, max=20, group='Swings settings (left)')
+left        = input.int   (    5     ,         ''     ,  minval=1, maxval=20, group='Swings settings (left)')
 showSB      = input.bool (    true   ,    'Show SB session', inline='SB'    , group='Silver Bullet session' )
 col_SB      = input.color(#b2b5be50,       '      '       , inline='SB'    , group='Silver Bullet session' )
 londonSession = input.session("0300-0400", "London Session", group='Silver Bullet session')
@@ -126,14 +126,16 @@ var  ZZ           aZZ         =
 var FVG[] bFVG_bull = array.new<FVG>(
  1, FVG.new(
    box    = box.new(na, na, na, na)
- , active = na
+ , active = false
+ , current = false
   )
  )
 
 var FVG[] bFVG_bear = array.new<FVG>(
  1, FVG.new(
    box    = box.new(na, na, na, na)
- , active = na
+ , active = false
+ , current = false
   )
  )
 
