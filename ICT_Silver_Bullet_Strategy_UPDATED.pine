@@ -107,7 +107,7 @@ type aPiv
 var float tradeEntryPrice = na
 var float tradeStopPrice = na
 var float tradeTargetPrice = na
-var bool tradeIsLong = na
+var bool tradeIsLong = true
 var bool beTriggered = false
 
 //-----------------------------------------------------------------------------}
@@ -232,7 +232,7 @@ f_setTrend() =>
 
 //===== BREAK-EVEN FUNCTION =====
 f_checkBreakEven() =>
-    if useBreakEven and not na(tradeEntryPrice) and not na(tradeStopPrice) and strategy.position_size != 0
+    if useBreakEven and not na(tradeEntryPrice) and strategy.position_size != 0
         riskPerUnit = math.abs(tradeEntryPrice - tradeStopPrice)
         currentRR = 0.0
         
